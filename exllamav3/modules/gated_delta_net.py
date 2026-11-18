@@ -705,10 +705,14 @@ class GatedDeltaNet(Module):
                     self.multi_qkvz = SlicedMultiLinear(self.device, [self.qkv_proj, self.z_proj])
                 except (ValueError, AssertionError):
                     self.multi_qkvz = None
-                # Unfusing policy judged on the slice width (see attn.py)
+                # Unfusing policy judged on the slice width (see attn.py). The qkvz bundle
+                # is only usable when the C++ BC_GatedDeltaNet family exists (CUDA); on ROCm
+                # the eager unfused path stays on separate per-projection calls.
                 if self.multi_qkvz is not None and not self.config.infer_params.use_mgemm(
                     self.multi_qkvz.K, self.multi_qkvz.width, self.multi_qkvz.mul1, device,
                 ):
+                    self.multi_qkvz = None
+                if self.multi_qkvz is not None and self.bc is None:
                     self.multi_qkvz = None
             if self.multi_qkvz is not None:
                 mq = self.multi_qkvz

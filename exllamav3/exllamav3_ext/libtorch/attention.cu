@@ -230,7 +230,13 @@ void BC_Attention::configure_slot
     s.block_n = block_n;
     s.splits_cap = splits_cap;
 
-    if (hidden_size_padded != hidden_size || g_weight)
+    if (hidden_size_padded != hidden_size || g_weight
+#ifdef USE_ROCM
+        // The fallback gemms are aten/cublas compositions with no patchable sites: the
+        // projection input must always be a static
+        || true
+#endif
+    )
     {
         // Zero-padded staging for the projection input (also required for an fp16 gate: the
         // captured cublas node reads a static input). The pad columns of xp are zeroed
@@ -240,9 +246,14 @@ void BC_Attention::configure_slot
         TORCH_CHECK(s.xp.is_contiguous(), "BC_Attention: statics must be contiguous");
         TORCH_CHECK(s.xp.size(0) >= R && s.xp.size(1) == hidden_size_padded, "BC_Attention: bad xp shape");
     }
-    if (hidden_size_padded != hidden_size)
+    if (hidden_size_padded != hidden_size
+#ifdef USE_ROCM
+        // The fallback o_proj gemm writes a static; the exact-width copy out to y is
+        // unconditional below
+        || true
+#endif
+    )
     {
-        // Padded o_proj output, trimmed to the exact width at the end of the graph
         TORCH_CHECK(yp, "BC_Attention: padded hidden size requires the yp static");
         s.yp = yp.value();
         TORCH_CHECK(s.yp.is_contiguous(), "BC_Attention: statics must be contiguous");
@@ -411,6 +422,9 @@ void BC_Attention::run_gr
     Graph* graph
 )
 {
+#ifndef USE_ROCM
+    (void) q_len;
+#endif
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
     int R = bsz * q_len;
     bool use_mgemm = kv_ptrs_trellis.has_value() && (R <= 32 || !k_proj);
@@ -423,7 +437,12 @@ void BC_Attention::run_gr
     // works at the padded width (the projections' actual K). An fp16 gate also stages: the
     // gate gemm is a captured cublas node with no patchable sites, so its input must be static
     const int hs = hidden_size_padded;
-    if (hs != hidden_size || g_weight)
+    if (hs != hidden_size || g_weight
+#ifdef USE_ROCM
+        // The fallback gemms have no patchable sites: always stage through the static
+        || true
+#endif
+    )
     {
         at::Tensor xp2 = s.xp.narrow(0, 0, R);
         copy2d_gr(x2, xp2, graph);
@@ -495,6 +514,8 @@ void BC_Attention::run_gr
     if (use_qkv)
     {
         // K and V already written by the sliced bundle
+#ifdef USE_ROCM
+#endif
     }
     else if (use_k_as_v)
     {
@@ -525,6 +546,8 @@ void BC_Attention::run_gr
         at::Tensor xh_kv = xh_flat.narrow(0, 0, (int64_t) 2 * R * hs).view({2, R, hs});
         exl3_mgemm_gr(x3, kv_ptrs_trellis.value(), kv2, kv_ptrs_suh.value(), xh_kv, kv_ptrs_svh.value(),
                       c10::nullopt, c10::nullopt, kv_K, -1, kv_mcg, kv_mul1, -1, -1, 0, graph);
+#ifdef USE_ROCM
+#endif
     }
     else
     {
@@ -559,12 +582,16 @@ void BC_Attention::run_gr
         rope_gr(s.q4, s.q4, s.k4, out_k4, ivf, (uint32_t) position, positions, position_ids, rope_style,
                 attn_factor, q_norm, k_norm, norm_eps, norm_constant_bias, l4_scaling_beta,
                 l4_scaling_original, rotate_dims, 0, graph);
+#ifdef USE_ROCM
+#endif
     }
 
     // Cache append (before attention: the split kernel counts the new tokens as part of the
     // sequence and reads them back from the cache)
     if (quant_cache)
     {
+#ifdef USE_ROCM
+#endif
         quant_cache_paged_gr(s.k4, cache_k, cache_k_scales.value(), s.v4, cache_v, cache_v_scales.value(),
                              cache_seqlens, block_table, page_size, q_len, 0.0f, true, graph);
     }
@@ -581,6 +608,8 @@ void BC_Attention::run_gr
             (void*) (intptr_t) (int) block_table.size(1),
         };
         s.k_update->launch(s.upd_grid.x, s.upd_grid.y, s.upd_grid.z, args, stream);
+#ifdef USE_ROCM
+#endif
         if (graph)
         {
             graph->record_param(s.k_update->handle(), GP_attn_block_table, 4);
@@ -829,13 +858,24 @@ void BC_Attention::run_gr
     // quantized o_proj), bias included, and the exact-width columns are copied out to y
     at::Tensor y2 = y.view({R, hidden_size});
     at::Tensor c2 = y2;
-    if (hs != hidden_size)
+    if (hs != hidden_size
+#ifdef USE_ROCM
+        // The fallback gemm has no patchable sites: write the static and copy out
+        || true
+#endif
+    )
         c2 = s.yp.narrow(0, 0, R);
     at::Tensor xh_o = xh_flat.narrow(0, 0, (int64_t) R * num_q_heads * head_dim).view({R, num_q_heads * head_dim});
     exl3_gemm_gr(s.o2, o_proj->trellis, c2, o_proj->suh, xh_o, o_proj->svh, -1, o_proj->mcg, o_proj->mul1, 0, graph);
     if (o_proj->bias)
         add_gr(c2, o_proj->bias.value(), c2, graph);
-    if (hs != hidden_size)
+#ifdef USE_ROCM
+#endif
+    if (hs != hidden_size
+#ifdef USE_ROCM
+        || true
+#endif
+    )
         copy2d_gr(c2, y2, graph);
 }
 
@@ -892,6 +932,11 @@ void BC_Attention::run
     // projections read the (static) buffer; otherwise the projections read x directly
     bool padded = hidden_size_padded != hidden_size;
     bool staged = padded || g_weight.has_value();
+#ifdef USE_ROCM
+    // The fallback gemms record no patchable sites: the staged input is always copied in and
+    // the o_proj output is always copied out, and the gemm A/C entries are omitted
+    staged = true;
+#endif
     void* xptr = staged ? s.xp.data_ptr() : (void*) x.data_ptr();
     if (staged)
         params.emplace_back(GP_copy2d_src, (void*) x.data_ptr());
@@ -899,6 +944,9 @@ void BC_Attention::run
     bool use_qkv = qkv_ptrs_trellis.has_value() && R <= 32;
 
     // Q / gate projections (an fp16 gate is a cublas node with no patchable sites)
+#ifdef USE_ROCM
+    // (covered by the staging copy)
+#else
     if (use_qkv)
         params.emplace_back(GP_mgemm_A, xptr);   // one sliced mgemm covers q, k, v (and a quantized gate)
     else if (use_qg_mgemm)
@@ -909,8 +957,12 @@ void BC_Attention::run
         if (gate_mode == 2 && !g_weight)
             params.emplace_back(GP_gemm_A, xptr);
     }
+#endif
 
     // K/V projections
+#ifdef USE_ROCM
+    // (covered by the staging copy)
+#else
     if (use_qkv)
     {
         // written by the bundle above
@@ -928,6 +980,7 @@ void BC_Attention::run
         params.emplace_back(GP_gemm_A, xptr);
         params.emplace_back(GP_gemm_A, xptr);
     }
+#endif
 
     // RoPE: which position source is active is a runtime branch in the kernel, so nulls are
     // patched like any other value. NoPE graphs contain no rope node
@@ -961,7 +1014,9 @@ void BC_Attention::run
     // QSA plane stages: qk projection, raw append, pool update
     if (qsa)
     {
+#ifndef USE_ROCM
         params.emplace_back(GP_gemm_A, xptr);
+#endif
         params.emplace_back(GP_attn_block_table, (void*) block_table.data_ptr());
         params.emplace_back(GP_attn_seqlens, (void*) cache_seqlens.data_ptr());
         params.emplace_back(GP_attn_num_pages, (void*) (uintptr_t) bt_width);
@@ -1004,14 +1059,24 @@ void BC_Attention::run
         params.emplace_back(GP_attn_num_splits, (void*) (uintptr_t) num_splits);
         params.emplace_back(GP_attn_num_splits, (void*) (uintptr_t) num_splits);   // combine kernel
     }
+#ifndef USE_ROCM
     void* yptr = padded ? s.yp.data_ptr() : (void*) y.data_ptr();
     params.emplace_back(GP_gemm_C, yptr);
+#endif
     if (o_proj->bias)
     {
+#ifdef USE_ROCM
+        void* yptr = s.yp.data_ptr();
+#endif
         params.emplace_back(GP_add_x, yptr);
         params.emplace_back(GP_add_z, yptr);
     }
-    if (padded)
+    if (padded
+#ifdef USE_ROCM
+        // the fallback o_proj gemm writes the static; the copy out is unconditional
+        || true
+#endif
+    )
         params.emplace_back(GP_copy2d_dst, (void*) y.data_ptr());
     s.graph->launch(params, stream);
 }

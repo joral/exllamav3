@@ -1,6 +1,9 @@
 #pragma once
+#ifndef USE_ROCM
 #include <cuda/atomic>
+#endif
 
+#ifndef USE_ROCM
 // Tensor core fragments
 
 template <typename T, int n>
@@ -316,6 +319,7 @@ static __forceinline__ __device__ uint32_t bfe64(uint32_t lo, uint32_t hi, int o
 
 // Inter-block barrier
 
+#ifndef USE_ROCM
 __device__ inline void group_barrier
 (
     int group_id,
@@ -346,3 +350,5 @@ __device__ inline void group_barrier
 
     __syncthreads();
 }
+#endif
+#endif  // USE_ROCM

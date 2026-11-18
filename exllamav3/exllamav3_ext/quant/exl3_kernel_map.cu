@@ -5,7 +5,9 @@
 namespace cg = cooperative_groups;
 #include "../util.h"
 #include "../util.cuh"
+#ifndef USE_ROCM
 #include "../ptx.cuh"
+#endif
 #include <tuple>
 #include <mutex>
 #include <map>

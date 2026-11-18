@@ -22,9 +22,12 @@
 #include "cpu/moe_mul1.h"
 #include "cpu/moe_handoff.h"
 
+// rms_norm / rms_norm_res_in now compile on ROCm too (norm.cu un-excluded); the
+// declarations must be visible in both branches.
+#include "norm.cuh"
+
 #if !defined(USE_ROCM)
 
-#include "norm.cuh"
 #include "hgemm.cuh"
 #include "rope.cuh"
 #include "softcap.cuh"
@@ -99,6 +102,11 @@
 #include "quant/reconstruct.cuh"
 #include "quant/hadamard.cuh"
 #include "quant/exl3_gemv.cuh"
+#include "quant/exl3_gemm.cuh"
+#include "quant/exl3_gemv_int8.cuh"
+
+#include "libtorch/linear.h"
+#include "libtorch/attention.h"
 
 #include "generator/strings.h"
 #include "generator/sampling_basic.cuh"
@@ -135,14 +143,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gr_mix", &gr_mix, "gr_mix");
     m.def("add_sigmoid_gate_proj", &add_sigmoid_gate_proj, "add_sigmoid_gate_proj");
 
-#if !defined(USE_ROCM)
     m.def("rms_norm", &rms_norm, "rms_norm",
         py::arg("x"), py::arg("w"), py::arg("y"), py::arg("epsilon"),
         py::arg("constant_bias"), py::arg("constant_scale"), py::arg("span_heads"),
         py::arg("add_residual"), py::arg("w_groups") = 1);
-#endif
-#if !defined(USE_ROCM)
     m.def("rms_norm_res_in", &rms_norm_res_in, "rms_norm_res_in");
+#if !defined(USE_ROCM)
     m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
     m.def("softcap", &softcap, "softcap");
 
@@ -337,6 +343,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("had_r_128_batch", &had_r_128_batch, "had_r_128_batch");
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
     m.def("exl3_gemv_supported", &exl3_gemv_supported, "exl3_gemv_supported");
+    // exl3_gemm / exl3_mgemm: ROCm fallback implementation (quant/exl3_gemm_rocm_fallback.cu)
+    m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
+    m.def("exl3_mgemm", &exl3_mgemm, "exl3_mgemm",
+          py::arg("A"), py::arg("B"), py::arg("C"), py::arg("suh"), py::arg("A_had"), py::arg("svh"),
+          py::arg("indices"), py::arg("weights"), py::arg("K"), py::arg("force_shape_idx"), py::arg("mcg"),
+          py::arg("mul1"), py::arg("min_index"), py::arg("max_index"), py::arg("force_num_sms"),
+          py::arg("num_tokens") = 1, py::arg("size_n_list") = py::none(), py::arg("c_ptrs") = py::none(),
+          py::arg("n_stride_list") = py::none(), py::arg("had_src_list") = py::none(), py::arg("num_had_src") = 0);
+    m.def("exl3_gemv_int8_max_k", &exl3_gemv_int8_max_k, "exl3_gemv_int8_max_k");
     m.def("exl3_moe_gfx12_k3", &exl3_moe_gfx12_k3, "exl3_moe_gfx12_k3");
     m.def("exl3_moe_gfx12_k3_prefill", &exl3_moe_gfx12_k3_prefill,
           "exl3_moe_gfx12_k3_prefill");
@@ -396,5 +411,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
     m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
     m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
+
+    // BC_LinearEXL3/FP16 + BC_Attention bindings. The class definitions come from the _hip
+    // header twins included at the top; the fallback gemms live in
+    // quant/exl3_gemm_rocm_fallback.cu
+    #include "libtorch/linear_bc.h"
+    #include "libtorch/attention_bc.h"
 #endif
 }

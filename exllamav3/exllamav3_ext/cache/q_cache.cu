@@ -41,14 +41,12 @@ void quant_cache_cont
     TORCH_CHECK(2 <= bits && bits <= 8, "no kernel for K/V bitrate");
 
     int num_blocks = CEIL_DIVIDE(bsz, MAX_WARPS * 4);
-    quant_cache_cont_kernel_instances[bits - 2]<<<num_blocks, MAX_WARPS * 32, 0, stream>>>
-    (
-        (const half*) in.data_ptr(),
-        (uint32_t*) out.data_ptr(),
-        (half*) out_scales.data_ptr(),
-        bsz,
-        compand_a
-    );
+    void* kernel_ptr = (void*) quant_cache_cont_kernel_instances[bits - 2];
+    const half* in_ptr = (const half*) in.data_ptr();
+    uint32_t* out_ptr = (uint32_t*) out.data_ptr();
+    half* out_scales_ptr = (half*) out_scales.data_ptr();
+    void* kernel_args[] = { &in_ptr, &out_ptr, &out_scales_ptr, &bsz, &compand_a };
+    cuda_check(cudaLaunchKernel(kernel_ptr, dim3(num_blocks), dim3(MAX_WARPS * 32), kernel_args, 0, stream));
     cuda_check(cudaPeekAtLastError());
 }
 
@@ -76,14 +74,12 @@ void quant_cache_cont_gr
     TORCH_CHECK(2 <= bits && bits <= 8, "no kernel for K/V bitrate");
 
     int num_blocks = CEIL_DIVIDE(bsz, MAX_WARPS * 4);
-    quant_cache_cont_kernel_instances[bits - 2]<<<num_blocks, MAX_WARPS * 32, 0, stream>>>
-    (
-        (const half*) in.data_ptr(),
-        (uint32_t*) out.data_ptr(),
-        (half*) out_scales.data_ptr(),
-        bsz,
-        compand_a
-    );
+    void* kernel_ptr = (void*) quant_cache_cont_kernel_instances[bits - 2];
+    const half* in_ptr = (const half*) in.data_ptr();
+    uint32_t* out_ptr = (uint32_t*) out.data_ptr();
+    half* out_scales_ptr = (half*) out_scales.data_ptr();
+    void* kernel_args[] = { &in_ptr, &out_ptr, &out_scales_ptr, &bsz, &compand_a };
+    cuda_check(cudaLaunchKernel(kernel_ptr, dim3(num_blocks), dim3(MAX_WARPS * 32), kernel_args, 0, stream));
     cuda_check(cudaPeekAtLastError());
 }
 
@@ -120,14 +116,12 @@ void dequant_cache_cont
     TORCH_CHECK(2 <= bits && bits <= 8, "no kernel for K/V bitrate");
 
     int num_blocks = CEIL_DIVIDE(bsz, MAX_WARPS * 4);
-    dequant_cache_cont_kernel_instances[bits - 2]<<<num_blocks, MAX_WARPS * 32, 0, stream>>>
-    (
-        (const uint32_t*) in.data_ptr(),
-        (const half*) in_scales.data_ptr(),
-        (half*) out.data_ptr(),
-        bsz,
-        compand_a
-    );
+    void* kernel_ptr = (void*) dequant_cache_cont_kernel_instances[bits - 2];
+    const uint32_t* in_ptr = (const uint32_t*) in.data_ptr();
+    const half* in_scales_ptr = (const half*) in_scales.data_ptr();
+    half* out_ptr = (half*) out.data_ptr();
+    void* kernel_args[] = { &in_ptr, &in_scales_ptr, &out_ptr, &bsz, &compand_a };
+    cuda_check(cudaLaunchKernel(kernel_ptr, dim3(num_blocks), dim3(MAX_WARPS * 32), kernel_args, 0, stream));
     cuda_check(cudaPeekAtLastError());
 }
 
@@ -325,24 +319,36 @@ void dequant_cache_paged
 
     TORCH_CHECK(2 <= k_bits && k_bits <= 8 && 2 <= v_bits && v_bits <= 8, "no kernel for K/V bitrate");
 
-    dequant_cache_paged_kernel_instances[k_bits - 2][v_bits - 2]<<<blocks, threads, 0, stream>>>
-    (
-        (const uint32_t*) k_in.data_ptr(),
-        (const half*) k_in_scales.data_ptr(),
-        (half*) k_out.data_ptr(),
-        (const uint32_t*) v_in.data_ptr(),
-        (const half*) v_in_scales.data_ptr(),
-        (half*) v_out.data_ptr(),
-        (const uint32_t*) cache_seqlens.data_ptr(),
-        (const uint32_t*) block_table.data_ptr(),
-        pages_per_seq,
-        groups_per_token,
-        chunks_per_token,
-        sliding_window,
-        compand_a,
-        0,
-        0
-    );
+    void* kernel_ptr = (void*) dequant_cache_paged_kernel_instances[k_bits - 2][v_bits - 2];
+    const uint32_t* k_in_ptr = (const uint32_t*) k_in.data_ptr();
+    const half* k_in_scales_ptr = (const half*) k_in_scales.data_ptr();
+    half* k_out_ptr = (half*) k_out.data_ptr();
+    const uint32_t* v_in_ptr = (const uint32_t*) v_in.data_ptr();
+    const half* v_in_scales_ptr = (const half*) v_in_scales.data_ptr();
+    half* v_out_ptr = (half*) v_out.data_ptr();
+    const uint32_t* cache_seqlens_ptr = (const uint32_t*) cache_seqlens.data_ptr();
+    const uint32_t* block_table_ptr = (const uint32_t*) block_table.data_ptr();
+    int compact_out = 0;
+    int zero_bonus = 0;
+    void* kernel_args[] =
+    {
+        &k_in_ptr,
+        &k_in_scales_ptr,
+        &k_out_ptr,
+        &v_in_ptr,
+        &v_in_scales_ptr,
+        &v_out_ptr,
+        &cache_seqlens_ptr,
+        &block_table_ptr,
+        &pages_per_seq,
+        &groups_per_token,
+        &chunks_per_token,
+        &sliding_window,
+        &compand_a,
+        &compact_out,
+        &zero_bonus
+    };
+    cuda_check(cudaLaunchKernel(kernel_ptr, blocks, threads, kernel_args, 0, stream));
     cuda_check(cudaPeekAtLastError());
 }
 
@@ -413,23 +419,35 @@ void dequant_cache_paged_window
 
     TORCH_CHECK(2 <= k_bits && k_bits <= 8 && 2 <= v_bits && v_bits <= 8, "no kernel for K/V bitrate");
 
-    dequant_cache_paged_kernel_instances[k_bits - 2][v_bits - 2]<<<blocks, threads, 0, stream>>>
-    (
-        (const uint32_t*) k_in.data_ptr(),
-        (const half*) k_in_scales.data_ptr(),
-        (half*) k_out.data_ptr(),
-        (const uint32_t*) v_in.data_ptr(),
-        (const half*) v_in_scales.data_ptr(),
-        (half*) v_out.data_ptr(),
-        (const uint32_t*) cache_seqlens.data_ptr(),
-        (const uint32_t*) block_table.data_ptr(),
-        pages_per_seq,
-        groups_per_token,
-        chunks_per_token,
-        -1,
-        compand_a,
-        1,
-        bonus_len
-    );
+    void* kernel_ptr = (void*) dequant_cache_paged_kernel_instances[k_bits - 2][v_bits - 2];
+    const uint32_t* k_in_ptr = (const uint32_t*) k_in.data_ptr();
+    const half* k_in_scales_ptr = (const half*) k_in_scales.data_ptr();
+    half* k_out_ptr = (half*) k_out.data_ptr();
+    const uint32_t* v_in_ptr = (const uint32_t*) v_in.data_ptr();
+    const half* v_in_scales_ptr = (const half*) v_in_scales.data_ptr();
+    half* v_out_ptr = (half*) v_out.data_ptr();
+    const uint32_t* cache_seqlens_ptr = (const uint32_t*) cache_seqlens.data_ptr();
+    const uint32_t* block_table_ptr = (const uint32_t*) block_table.data_ptr();
+    int no_window = -1;
+    int compact_out = 1;
+    void* kernel_args[] =
+    {
+        &k_in_ptr,
+        &k_in_scales_ptr,
+        &k_out_ptr,
+        &v_in_ptr,
+        &v_in_scales_ptr,
+        &v_out_ptr,
+        &cache_seqlens_ptr,
+        &block_table_ptr,
+        &pages_per_seq,
+        &groups_per_token,
+        &chunks_per_token,
+        &no_window,
+        &compand_a,
+        &compact_out,
+        &bonus_len
+    };
+    cuda_check(cudaLaunchKernel(kernel_ptr, blocks, threads, kernel_args, 0, stream));
     cuda_check(cudaPeekAtLastError());
 }

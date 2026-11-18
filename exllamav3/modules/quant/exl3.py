@@ -160,12 +160,11 @@ class LinearEXL3:
         if not reconstruct:
             rows = x.numel() // x.shape[-1]
             if rows <= AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct:
-                if self.bc is not None:
-                    dtype = out_dtype or self.default_out_dtype
-                    return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
                 # ROCm HIP decode GEMV (tensor-core path). NVIDIA builds are untouched:
                 # torch.version.hip is None there. Only the shapes the kernel hard-requires
                 # are routed here; everything else falls through to reconstruct + hgemm.
+                # Checked before the BC fallback: on HIP the BC_LinearEXL3 objects exist as
+                # BC_Attention ctor arguments, but the tuned GEMV beats the fallback GEMM here.
                 if (torch.version.hip and os.environ.get("EXL3_GEMV", "1") != "0"
                         and hasattr(ext, "exl3_gemv") and _hip_gemv_supported(x.device)
                         and rows <= EXL3_GEMV_HIP_MAX_M

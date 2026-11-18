@@ -5,7 +5,16 @@ py::class_<TritonKernel, std::shared_ptr<TritonKernel>>(m, "TritonKernel").def
     py::arg("name"),
     py::arg("num_warps"),
     py::arg("shared_bytes")
-);
+)
+.def("launch",
+    [](const TritonKernel& self, int gx, int gy, int gz, std::vector<int64_t> args, int64_t stream)
+    {
+        std::vector<void*> va;
+        va.reserve(args.size());
+        for (auto a : args) va.push_back((void*) (uintptr_t) a);
+        self.launch(gx, gy, gz, va, (cudaStream_t) (uintptr_t) stream);
+    },
+    py::arg("gx"), py::arg("gy"), py::arg("gz"), py::arg("args"), py::arg("stream"));
 
 py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
 (

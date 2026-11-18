@@ -84,7 +84,9 @@ def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
         with torch.cuda.device(device):
             src = ASTSource(fn = fn, signature = sig, constexprs = constexprs, attrs = attrs)
             ck = triton.compile(src, options = {"num_warps": num_warps, "num_stages": num_stages})
-            k = ext.TritonKernel(ck.asm["cubin"], ck.metadata.name, ck.metadata.num_warps, ck.metadata.shared)
+            # CUDA compiles to cubin; the AMD backend exposes the code object as hsaco
+            bin_key = "hsaco" if torch.version.hip else "cubin"
+            k = ext.TritonKernel(ck.asm[bin_key], ck.metadata.name, ck.metadata.num_warps, ck.metadata.shared)
         _kernel_cache[key] = k
     return k
 
@@ -368,10 +370,13 @@ class BCAttn:
         # hidden width into it). An fp16 gate also stages the input (static operand for the
         # captured cublas node), without the padded output
         xp, yp = None, None
-        if self.hidden_padded != self.hidden_size or self.g_weight is not None:
+        hip = torch.version.hip is not None
+        # On HIP the fallback gemms are aten/cublas compositions with no patchable sites, so
+        # the input is always staged and the o_proj output always goes through the static
+        if self.hidden_padded != self.hidden_size or self.g_weight is not None or hip:
             xp = g_tensor_cache.get(dev, (R, self.hidden_padded), torch.half, "bca_xp")
             xp.zero_()
-        if self.hidden_padded != self.hidden_size:
+        if self.hidden_padded != self.hidden_size or hip:
             yp = g_tensor_cache.get(dev, (R, self.hidden_padded), self.o_dtype or torch.half, "bca_yp")
 
         self.bc.configure_slot(
