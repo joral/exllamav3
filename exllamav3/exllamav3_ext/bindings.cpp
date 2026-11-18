@@ -1,5 +1,12 @@
 #include <cuda_fp16.h>
 
+// ROCm's hip/amd_detail/host_defines.h defines __noinline__ as a macro, which
+// collides with [[__gnu__::__noinline__]] inside libstdc++ (GCC 16) <format>.
+// hip_fp16.h (hipified from cuda_fp16.h) includes host_defines.h.
+#ifdef __HIP_PLATFORM_AMD__
+#undef __noinline__
+#endif
+
 #include <torch/extension.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
