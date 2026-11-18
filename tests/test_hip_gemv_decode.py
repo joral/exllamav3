@@ -371,12 +371,28 @@ def test_hip_gemv_k2_rows_8_routes_to_gemv():
 
 
 @torch.inference_mode()
-def test_hip_gemv_k2_rows_9_falls_back():
+def test_hip_gemv_k2_mcg_rows_9_falls_back():
+    """K2/mcg has no MMODE-2 instantiation (only K2 mul1); 9+ rows fall back to reconstruct+hgemm."""
     _require_gfx12()
     actual, expected, calls, x, size_n = _run_rows_synthetic_oracle(2, True, False, 9, torch.float16)
     assert calls["gemv"] == 0
     assert calls["reconstruct"] > 0
     assert calls["hgemm"] > 0
+    assert torch.isfinite(actual).all()
+    assert torch.isfinite(expected).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0.03)
+
+
+@pytest.mark.parametrize("rows", [9, 12, 16], ids=["rows-9", "rows-12", "rows-16"])
+@torch.inference_mode()
+def test_hip_gemv_k2_mul1_rows_9_to_16_routes_to_gemv(rows):
+    """K2/mul1 has an MMODE-2 instantiation; 9..16 rows use GEMV and match the reconstruct oracle."""
+    actual, expected, calls, x, size_n = _run_rows_synthetic_oracle(2, False, True, rows, torch.float16)
+    assert calls["gemv"] == 1
+    assert calls["reconstruct"] == 0
+    assert calls["reconstruct_slice"] == 0
+    assert calls["reconstruct_had_slice"] == 0
+    assert calls["hgemm"] == 0
     assert torch.isfinite(actual).all()
     assert torch.isfinite(expected).all()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0.03)
@@ -531,8 +547,10 @@ def test_hip_gemv_rows_9_to_16_route_to_gemv(model, rows):
     linear = model.find_module("model.language_model.layers.3.self_attn.q_proj")
     try:
         linear.load(device="cuda")
-        assert linear.inner.K == 4
-        assert linear.inner.mcg != linear.inner.mul1
+        # Fixture-neutral eligibility: this suite ships against several quantizations whose
+        # per-tensor bitrates differ; what must hold is GEMV eligibility for the 16-row mode.
+        assert (linear.inner.K, bool(linear.inner.mcg), bool(linear.inner.mul1)) \
+            in exl3_quant._EXL3_GEMV_HIP_MMODE2_VARIANTS
         x = torch.randn((1, rows, linear.in_features), dtype=torch.float16, device="cuda")
         calls, restore = _spy_ext_route()
         try:
@@ -612,13 +630,13 @@ def test_hip_gemv_rollback_cap_falls_back(model, monkeypatch):
 
 @torch.inference_mode()
 def test_hip_gemv_rows_over_limit_falls_back(model):
-    """A K=4 decode batch with exactly seventeen rows must bypass HIP GEMV."""
+    """A decode batch with exactly seventeen rows must bypass HIP GEMV."""
     assert exl3_quant.EXL3_GEMV_HIP_MAX_M == 16
     linear = model.find_module("model.language_model.layers.3.self_attn.q_proj")
     try:
         linear.load(device="cuda")
-        assert linear.inner.K == 4
-        assert linear.inner.mcg != linear.inner.mul1
+        assert (linear.inner.K, bool(linear.inner.mcg), bool(linear.inner.mul1)) \
+            in exl3_quant._EXL3_GEMV_HIP_MMODE2_VARIANTS
         x = torch.randn((1, 17, linear.in_features), dtype=torch.float16, device="cuda")
         calls, restore = _spy_ext_route()
         try:
@@ -634,11 +652,12 @@ def test_hip_gemv_rows_over_limit_falls_back(model):
 
 @torch.inference_mode()
 def test_hip_gemv_env_opt_out_falls_back(model, monkeypatch):
-    """EXL3_GEMV=0 forces the eligible K6 vocabulary head back to reconstruct+hgemm."""
+    """EXL3_GEMV=0 forces the eligible vocabulary head back to reconstruct+hgemm."""
     linear = model.find_module("lm_head")
     try:
         linear.load(device="cuda")
-        assert linear.inner.K == 6
+        assert (linear.inner.K, bool(linear.inner.mcg), bool(linear.inner.mul1)) \
+            in exl3_quant._EXL3_GEMV_HIP_MMODE2_VARIANTS
         x = torch.randn((1, 1, linear.in_features), dtype=torch.float16, device="cuda")
         monkeypatch.setenv("EXL3_GEMV", "0")
         calls, restore = _spy_ext_route()
@@ -657,9 +676,9 @@ def test_hip_gemv_env_opt_out_falls_back(model, monkeypatch):
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("out_dtype", [torch.float16, torch.float32], ids=["fp16", "fp32"])
 @torch.inference_mode()
-def test_hip_gemv_k6_lm_head_matches_reference(model, batch_size, out_dtype):
-    """Each model fixture's K6 vocabulary head routes directly and matches its oracle."""
-    _load_then_compare(model, "lm_head", None, batch_size, out_dtype, expected_K=6)
+def test_hip_gemv_lm_head_matches_reference(model, batch_size, out_dtype):
+    """The model fixture's vocabulary head (K varies per quantization) routes directly and matches its oracle."""
+    _load_then_compare(model, "lm_head", None, batch_size, out_dtype, expected_K=None)
 
 
 @torch.inference_mode()

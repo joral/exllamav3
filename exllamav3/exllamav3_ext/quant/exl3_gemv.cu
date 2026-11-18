@@ -844,8 +844,7 @@ static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int 
 #endif
     if (K != 4 && cb == 0) return -1;
 #if defined(USE_ROCM)
-    // K2 has no HIP MMODE-2 instantiation; its established envelope ends at eight rows.
-    if (K == 2 && size_m > EXL3_GEMV_MAX_M) return -1;
+    // K2+mul1 has a HIP MMODE-2 instantiation (16-row WMMA); K2 rows beyond 16 reject below.
     if (size_m > EXL3_GEMV_ROCM_MAX_M) return -1;
 #else
     if (size_m > EXL3_GEMV_MAX_M) return -1;
@@ -894,6 +893,7 @@ static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, i
     SEL_GRID(3, 1) SEL_GRID(3, 2)
     SEL_GRID(5, 1) SEL_GRID(5, 2)
     SEL_GRID(6, 1) SEL_GRID(6, 2)
+    SEL_MMODE2_GRID(2, 2)
     SEL_MMODE2_GRID(3, 2) SEL_MMODE2_GRID(4, 1) SEL_MMODE2_GRID(4, 2)
     SEL_MMODE2_GRID(5, 2) SEL_MMODE2_GRID(6, 1) SEL_MMODE2_GRID(6, 2)
     #undef SEL_MMODE2_GRID
@@ -947,8 +947,7 @@ bool exl3_gemv_try_launch
 #endif
     if (K != 4 && cb == 0) return false;
 #if defined(USE_ROCM)
-    // K2 has no HIP MMODE-2 instantiation; its established envelope ends at eight rows.
-    if (K == 2 && size_m > EXL3_GEMV_MAX_M) return false;
+    // K2+mul1 has a HIP MMODE-2 instantiation (16-row WMMA); rows beyond 16 reject below.
     if (size_m > EXL3_GEMV_ROCM_MAX_M) return false;
 #else
     if (size_m > EXL3_GEMV_MAX_M) return false;

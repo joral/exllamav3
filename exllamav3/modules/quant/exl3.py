@@ -22,7 +22,7 @@ def _hip_gemv_max_rows() -> int:
 EXL3_GEMV_HIP_MAX_M = _hip_gemv_max_rows()
 _EXL3_GEMV_HIP_MMODE1_MAX_M = 8
 _EXL3_GEMV_HIP_MMODE2_VARIANTS = frozenset({
-    (3, False, True), (4, True, False), (4, False, True),
+    (2, False, True), (3, False, True), (4, True, False), (4, False, True),
     (5, False, True), (6, True, False), (6, False, True),
 })
 
