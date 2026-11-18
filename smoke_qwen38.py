@@ -20,20 +20,17 @@ MODEL_DIR = os.path.expanduser(
     "~/Projects/exllamav3-data/models/Qwen3.8-27B-exl3-3.00bpw"
 )
 CACHE_TOKENS = 16384
-MAX_NEW_TOKENS = 150
+MAX_NEW_TOKENS = 400
 
 PROMPT = (
     "Give one short paragraph: what is the Collatz conjecture, and why is it hard to prove?"
 )
 
 def format_prompt(p: str) -> str:
-    # chatml-style; empty think block for non-thinking generation
-    return (
-        "<|im_start|>user\n"
-        f"{p}<|im_end|>\n"
-        "<|im_start|>assistant\n"
-        "<think>\n\n</think>"
-    )
+    # Model's own chat_template.jinja via Tokenizer.hf_chat_template
+    # (transformers renders it; enable_thinking=False prefills the empty
+    # think block). Placeholder kept for reference; unused.
+    return f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n"
 
 def main():
     assert torch.version.hip, "expected ROCm build of torch"
@@ -60,7 +57,9 @@ def main():
     generator = Generator(model=model, cache=cache, tokenizer=tokenizer)
 
     job = Job(
-        input_ids=tokenizer.encode(format_prompt(PROMPT), add_bos=True),
+        input_ids=tokenizer.hf_chat_template(
+            [{"role": "user", "content": PROMPT}], enable_thinking=False,
+        ),
         max_new_tokens=MAX_NEW_TOKENS,
         stop_conditions=[tokenizer.eos_token_id, "<|im_end|>"],
         identifier=0,
