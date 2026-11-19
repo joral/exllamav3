@@ -37,6 +37,12 @@ BLOCK_GRAPH_ENABLED = os.environ.get("EXL3_BLOCK_GRAPH", "0") == "1"
 BLOCK_GRAPH_WARMUPS = max(1, _env_int("EXL3_BLOCK_GRAPH_WARMUPS", 3))
 BLOCK_GRAPH_MAX_SLOTS = max(1, _env_int("EXL3_BLOCK_GRAPH_MAX_SLOTS", 4))
 
+MLP_GRAPH_ENABLED = os.environ.get("EXL3_MLP_GRAPH", "0") == "1"
+MLP_GRAPH_WARMUPS = max(1, _env_int("EXL3_MLP_GRAPH_WARMUPS", 3))
+MLP_GRAPH_MAX_SLOTS = max(1, _env_int("EXL3_MLP_GRAPH_MAX_SLOTS", 8))
+MLP_GRAPH_MAX_ROWS = _env_int("EXL3_MLP_GRAPH_MAX_ROWS", 32)
+MLP_GRAPH_DEBUG = os.environ.get("EXL3_MLP_GRAPH_DEBUG", "0") == "1"
+
 # Rows above the dense GEMV cap reconstruct+hgemm; still captureable, but the first bounded
 # implementation keeps the served decode envelope. Revisit after (B,Q) family measurements.
 BLOCK_GRAPH_MAX_ROWS = _env_int("EXL3_BLOCK_GRAPH_MAX_ROWS", 16)
@@ -389,3 +395,199 @@ def purge():
     _registry.clear()
     _shared_pools.clear()
     _total_captures[0] = 0
+
+
+# ============================================================================
+# Per-MLP graph capture (dense GatedMLP decode path)
+#
+# Scope: GatedMLP blocks whose decode shape takes the split gate/up + down GEMV path
+# (no fused multi_gu, no TP reduce, no BC_GatedMLP internal graph). The eager MLP path
+# is a chain of raw kernel launches (ext gemv chunks, aten activation) with no host
+# syncs and no state mutation: replay is output-identical (verified bit-exact against
+# eager on layers 1-4 of the Qwen3.5-27B GDN hybrid at rows=18). The attention/GDN
+# internals of a block are NOT naive-capture safe (pointer-patched replay graphs inside
+# a captured region bake stale pointers), so the capture deliberately stops at the MLP
+# boundary.
+#
+# Opt-in via EXL3_MLP_GRAPH=1 (default off). Slots key on (device, shape, dtype,
+# out_dtype) + the eligibility predicate below, so prefill (rows > cap) and BC-eligible
+# small shapes stay eager and the captured region is branch-stable.
+# ============================================================================
+
+_mlp_registry: list["MLPGraphRunner"] = []
+
+
+class _MLPGraphSlot:
+    __slots__ = ("graph", "x_in", "y_out", "last_used")
+
+    def __init__(self, graph, x_in, y_out, stamp):
+        self.graph = graph
+        self.x_in = x_in
+        self.y_out = y_out
+        self.last_used = stamp
+
+
+class MLPGraphRunner:
+    """Owns the graph slots of one GatedMLP. Attached lazily on first eligible decode call;
+    all decline paths return None and the caller falls through to the eager forward."""
+
+    def __init__(self, mlp):
+        self.mlp = mlp
+        self.slots: dict[tuple, _MLPGraphSlot] = {}
+        self.warmups_left: dict[tuple, int] = {}
+        self.disabled: set[tuple] = set()
+        self.stamp = 0
+        self._capturing = False
+        self.stats = {"captures": 0, "replays": 0, "warmups": 0, "declines": Counter()}
+
+    # -- eligibility -----------------------------------------------------------
+
+    def slot_key(self, x: torch.Tensor, params: dict, out_dtype):
+        """Specialization key, or None when this call must not be graphed."""
+        mlp = self.mlp
+        if x.device.type != "cuda" or not x.is_contiguous():
+            return None
+        if x.dtype not in (torch.half, torch.bfloat16):
+            return None
+        if "reconstruct" in params or "ovr" in params or params.get("prefill"):
+            return None
+        bsz, q_len, dim = x.shape
+        rows = bsz * q_len
+        if not (dim == mlp.hidden_size and 1 <= rows <= MLP_GRAPH_MAX_ROWS):
+            return None
+        # Single-slice eager split path only: fused multi_gu and the bsz<=8 BC_GatedMLP
+        # internal graph take different branch arms whose capture safety is unproven.
+        if mlp.num_slices != 1 or mlp.tp_reduce:
+            return None
+        _max_bszn = 8  # must match MAX_BSZN in mlp.py / block_sparse_mlp.py / libtorch/mlp.h
+        if mlp.bc is not None and rows <= _max_bszn:
+            return None
+        if mlp.multi_gu[0] is not None and rows <= 32:
+            return None
+        if out_dtype not in (None, mlp.out_dtype):
+            return None
+        return (x.device.index, tuple(x.shape), str(x.dtype))
+
+    # -- dispatch --------------------------------------------------------------
+
+    def maybe_forward(self, x: torch.Tensor, params: dict, out_dtype):
+        key = self.slot_key(x, params, out_dtype)
+        if key is None or key in self.disabled or self._capturing:
+            return None
+        slot = self.slots.get(key)
+        if slot is not None:
+            return self._replay(slot, x)
+        left = self.warmups_left.setdefault(key, MLP_GRAPH_WARMUPS)
+        if left > 0:
+            self.warmups_left[key] = left - 1
+            self.stats["warmups"] += 1
+            return None
+        return self._capture(key, x, params, out_dtype)
+
+    def _evict_to_limit(self, dev):
+        while len(self.slots) >= MLP_GRAPH_MAX_SLOTS:
+            oldest_key = min(self.slots, key = lambda k: self.slots[k].last_used)
+            if dev is not None:
+                torch.cuda.synchronize(dev)
+            del self.slots[oldest_key]
+            self.stats["evictions"] = self.stats.get("evictions", 0) + 1
+
+    def _capture(self, key, x: torch.Tensor, params: dict, out_dtype):
+        dev = x.device
+        self._capturing = True
+        try:
+            torch.cuda.synchronize(dev)
+            x_in = torch.empty_like(x)
+            x_in.copy_(x)
+            graph = torch.cuda.CUDAGraph()
+            graph_kwargs = {"capture_error_mode":
+                            os.environ.get("EXL3_MLP_GRAPH_CAPTURE_MODE", "thread_local")}
+            pool = _pool_for(dev.index)
+            if pool is not None:
+                graph_kwargs["pool"] = pool
+            graph_kwargs["stream"] = _capture_stream_for(dev.index)
+            with torch.cuda.device(dev):
+                with torch.cuda.graph(graph, **graph_kwargs):
+                    y_cap = self.mlp.forward(x_in, params, out_dtype)
+            torch.cuda.synchronize(dev)
+        except Exception as e:
+            self.disabled.add(key)
+            self.stats["captures"] += 1
+            self.stats["capture_failed"] = self.stats.get("capture_failed", 0) + 1
+            self.stats["declines"][f"capture_error:{type(e).__name__}"] += 1
+            raise
+        finally:
+            self._capturing = False
+        # y_cap's storage is uninitialized at capture exit (capture does not execute). Store it
+        # as the slot output directly: every replay rewrites it, and _replay clones only after
+        # its replay has run, so callers never see capture-time garbage.
+        self.stamp += 1
+        self._evict_to_limit(dev)
+        self.slots[key] = _MLPGraphSlot(graph, x_in, y_cap, self.stamp)
+        self.stats["captures"] += 1
+        if MLP_GRAPH_DEBUG:
+            print(f"[mlpgraph] captured {self.mlp.key} key={key[1:]}", flush=True)
+        return self._replay(self.slots[key], x)
+
+    def _replay(self, slot: _MLPGraphSlot, x: torch.Tensor):
+        key = next(k for k, v in self.slots.items() if v is slot)
+        self.stamp += 1
+        slot.last_used = self.stamp
+        try:
+            slot.x_in.copy_(x)
+            with torch.cuda.device(x.device):
+                slot.graph.replay()
+        except Exception as e:
+            self.disabled.add(key)
+            self.stats["declines"][f"replay_error:{type(e).__name__}"] += 1
+            raise
+        self.stats["replays"] += 1
+        return slot.y_out.clone()
+
+    _capturing = False
+
+
+def maybe_mlp_graph_forward(mlp, x: torch.Tensor, params: dict, out_dtype):
+    """Entry hook for GatedMLP.forward. Returns a graphed output tensor, or None to decline."""
+    if not MLP_GRAPH_ENABLED:
+        return None  # dynamic check: the flag may be toggled mid-process for qualification
+    runner = getattr(mlp, "mlp_graph_runner", None)
+    if runner is None:
+        if getattr(mlp, "_mlp_graph_checked", False):
+            return None
+        mlp._mlp_graph_checked = True
+        if mlp.__class__.__name__ != "GatedMLP":
+            return None  # cheap structural pre-filter; full eligibility checked per call
+        runner = mlp.mlp_graph_runner = MLPGraphRunner(mlp)
+        _mlp_registry.append(runner)
+    return runner.maybe_forward(x, params, out_dtype)
+
+
+def global_mlp_stats():
+    out = {"runners": len(_mlp_registry), "captures": 0, "replays": 0, "warmups": 0,
+           "evictions": 0, "declines": Counter(), "capture_failed": 0}
+    for r in _mlp_registry:
+        for k in ("captures", "replays", "warmups", "evictions", "capture_failed"):
+            out[k] += r.stats.get(k, 0)
+        out["declines"].update(r.stats["declines"])
+    return out
+
+
+def release_all_mlp_graphs():
+    """Release every live MLP graph (qualification harness teardown)."""
+    for r in _mlp_registry:
+        if r.slots:
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            r.slots.clear()
+        m = r.mlp
+        if m is not None:
+            for attr in ("mlp_graph_runner", "_mlp_graph_checked"):
+                if hasattr(m, attr):
+                    try:
+                        delattr(m, attr)
+                    except Exception:
+                        pass
+    _mlp_registry.clear()

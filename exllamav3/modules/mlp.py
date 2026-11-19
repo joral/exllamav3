@@ -724,6 +724,11 @@ class GatedMLP(Module):
         params: dict,
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
+        from .block_graph import maybe_mlp_graph_forward
+        y = maybe_mlp_graph_forward(self, x, params, out_dtype)
+        if y is not None:
+            return y
+
         bsz, q_len, dim = x.shape
 
         if self.num_slices == 0:
