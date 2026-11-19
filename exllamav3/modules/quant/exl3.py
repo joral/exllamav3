@@ -11,15 +11,17 @@ AUTO_RECONSTRUCT_THRESHOLD = 144
 MAX_RECONSTRUCT_SLICE_N = 32768
 RECONSTRUCT_SLICE_GRANULARITY_N = 128
 
+
+# Runtime rollback cap for the ROCm GEMV path; larger decode batches reconstruct. The
+# kernel computes one 16-row tile per call, so rows 17..32 run as consecutive 16-row
+# chunks (a full MMODE-2 call plus a small tail) instead of falling back to reconstruct.
 def _hip_gemv_max_rows() -> int:
     try:
-        return max(1, min(16, int(os.environ.get("EXL3_GEMV_HIP_MAX_M", "16"))))
+        return max(1, min(32, int(os.environ.get("EXL3_GEMV_HIP_MAX_M", "32"))))
     except ValueError:
-        return 16
-
-
-# Runtime rollback cap for the ROCm 16-row GEMV path; larger decode batches reconstruct.
+        return 32
 EXL3_GEMV_HIP_MAX_M = _hip_gemv_max_rows()
+_EXL3_GEMV_HIP_CHUNK = 16
 _EXL3_GEMV_HIP_MMODE1_MAX_M = 8
 _EXL3_GEMV_HIP_MMODE2_VARIANTS = frozenset({
     (2, False, True), (3, False, True), (4, True, False), (4, False, True),
@@ -183,6 +185,9 @@ class LinearEXL3:
         # ROCm decode GEMV: same output contract as reconstruct_hgemm (shape[:-1] +
         # out_features, contiguous, bias applied). A_had is the fp16 workspace the
         # kernel's input-Hadamard stage writes into before the main loop.
+        # The kernel computes one 16-row tile per call; larger row counts run as
+        # consecutive chunks into the same output (batched MTP verify lands at
+        # rows = jobs * (accepted + 1), typically 18-24).
         shape = x.shape
         rows = x.numel() // shape[-1]
         out_shape = shape[:-1] + (self.out_features,)
@@ -191,7 +196,10 @@ class LinearEXL3:
         y_flat = y.view(rows, self.out_features)
         A_had = g_tensor_cache.get(
             x.device, (rows, self.in_features), torch.half, "exl3_gemv_a_had")
-        ext.exl3_gemv(x_flat, self.trellis, y_flat, self.suh, A_had, self.svh, self.mcg, self.mul1)
+        for r0 in range(0, rows, _EXL3_GEMV_HIP_CHUNK):
+            r1 = min(r0 + _EXL3_GEMV_HIP_CHUNK, rows)
+            ext.exl3_gemv(x_flat[r0:r1], self.trellis, y_flat[r0:r1],
+                          self.suh, A_had[r0:r1], self.svh, self.mcg, self.mul1)
         if self.bias is not None:
             y += self.bias
         return y

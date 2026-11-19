@@ -543,7 +543,7 @@ def test_hip_gemv_route_only(model):
 @torch.inference_mode()
 def test_hip_gemv_rows_9_to_16_route_to_gemv(model, rows):
     """The MMODE-2 rows must use GEMV rather than reconstruct+hgemm."""
-    assert exl3_quant.EXL3_GEMV_HIP_MAX_M == 16
+    assert exl3_quant.EXL3_GEMV_HIP_MAX_M == 32
     linear = model.find_module("model.language_model.layers.3.self_attn.q_proj")
     try:
         linear.load(device="cuda")
@@ -575,7 +575,7 @@ def test_hip_gemv_import_time_max_m_parser(monkeypatch):
     try:
         monkeypatch.delenv("EXL3_GEMV_HIP_MAX_M", raising=False)
         importlib.reload(exl3_quant)
-        assert exl3_quant.EXL3_GEMV_HIP_MAX_M == 16
+        assert exl3_quant.EXL3_GEMV_HIP_MAX_M == 32
 
         monkeypatch.setenv("EXL3_GEMV_HIP_MAX_M", "8")
         importlib.reload(exl3_quant)
@@ -583,7 +583,7 @@ def test_hip_gemv_import_time_max_m_parser(monkeypatch):
 
         monkeypatch.setenv("EXL3_GEMV_HIP_MAX_M", "bogus")
         importlib.reload(exl3_quant)
-        assert exl3_quant.EXL3_GEMV_HIP_MAX_M == 16
+        assert exl3_quant.EXL3_GEMV_HIP_MAX_M == 32
 
         monkeypatch.setenv("EXL3_GEMV_HIP_MAX_M", "0")
         importlib.reload(exl3_quant)
@@ -591,7 +591,7 @@ def test_hip_gemv_import_time_max_m_parser(monkeypatch):
 
         monkeypatch.setenv("EXL3_GEMV_HIP_MAX_M", "17")
         importlib.reload(exl3_quant)
-        assert exl3_quant.EXL3_GEMV_HIP_MAX_M == 16
+        assert exl3_quant.EXL3_GEMV_HIP_MAX_M == 17
     finally:
         monkeypatch.delenv("EXL3_GEMV_HIP_MAX_M", raising=False)
         if original != 16:
@@ -604,7 +604,7 @@ def test_hip_gemv_rollback_cap_falls_back(model, monkeypatch):
     """The EXL3_GEMV_HIP_MAX_M rollback cap returns m=9 to reconstruct+hgemm."""
     import importlib
 
-    assert exl3_quant.EXL3_GEMV_HIP_MAX_M == 16
+    assert exl3_quant.EXL3_GEMV_HIP_MAX_M == 32
     try:
         with monkeypatch.context() as rollback:
             rollback.setenv("EXL3_GEMV_HIP_MAX_M", "8")
@@ -630,23 +630,48 @@ def test_hip_gemv_rollback_cap_falls_back(model, monkeypatch):
 
 @torch.inference_mode()
 def test_hip_gemv_rows_over_limit_falls_back(model):
-    """A decode batch with exactly seventeen rows must bypass HIP GEMV."""
-    assert exl3_quant.EXL3_GEMV_HIP_MAX_M == 16
+    """A decode batch with thirty-three rows must bypass HIP GEMV entirely."""
+    assert exl3_quant.EXL3_GEMV_HIP_MAX_M == 32
     linear = model.find_module("model.language_model.layers.3.self_attn.q_proj")
     try:
         linear.load(device="cuda")
         assert (linear.inner.K, bool(linear.inner.mcg), bool(linear.inner.mul1)) \
             in exl3_quant._EXL3_GEMV_HIP_MMODE2_VARIANTS
-        x = torch.randn((1, 17, linear.in_features), dtype=torch.float16, device="cuda")
+        x = torch.randn((1, 33, linear.in_features), dtype=torch.float16, device="cuda")
         calls, restore = _spy_ext_route()
         try:
             y = linear.forward(x, {"reconstruct": False})
         finally:
             restore()
-        assert calls["gemv"] == 0, "m=17 must bypass the m <= 16 GEMV kernel"
+        assert calls["gemv"] == 0, "m=33 must bypass the chunked GEMV route"
         assert calls["reconstruct"] > 0 and calls["hgemm"] > 0
         assert torch.isfinite(y.float()).all()
     finally:
+        linear.unload()
+
+
+@torch.inference_mode()
+def test_hip_gemv_rows_17_to_32_chunk(model):
+    """Rows 17..32 run as consecutive 16-row GEMV chunks, never reconstruct."""
+    linear = model.find_module("model.language_model.layers.3.self_attn.q_proj")
+    try:
+        linear.load(device="cuda")
+        for rows in (17, 18, 32):
+            torch.manual_seed(rows)
+            x = torch.randn((1, rows, linear.in_features), dtype=torch.float16, device="cuda")
+            calls, restore = _spy_ext_route()
+            try:
+                y = linear.forward(x, {"reconstruct": False})
+            finally:
+                restore()
+            expect = (rows + 15) // 16
+            assert calls["gemv"] == expect, \
+                f"m={rows} must make exactly {expect} GEMV calls, got {calls['gemv']}"
+            assert calls["reconstruct"] == 0
+            assert calls["hgemm"] == 0
+            assert torch.isfinite(y.float()).all()
+    finally:
+        linear.unload()
         linear.unload()
 
 
