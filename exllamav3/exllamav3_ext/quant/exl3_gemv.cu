@@ -1008,6 +1008,10 @@ bool exl3_gemv_try_launch
     void* kernel = cfg == 0 ? narrow_kernel : exl3_gemv_select_kernel(K, cb, c_fp32, mmode, cfg, smem);
     if (!kernel) return false;
 
+    if (exl3_gemv_debug())
+        std::fprintf(stderr, "EXL3_GEMV_LAUNCH m=%d k=%d n=%d K=%d cb=%d mmode=%d cfg=%d cfp32=%d\n",
+                     size_m, size_k, size_n, K, cb, mmode, cfg, (int) c_fp32);
+
     int block_dim = cfg == 0 ? 512 : 256;
     int cols = cfg == 0 ? 32 : 64;
 

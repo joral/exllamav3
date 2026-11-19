@@ -313,6 +313,15 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 #if defined(USE_ROCM) || defined(__HIPCC__)
     // HIP: staged extraction always on (gfx12 WMMA operands must not come from __shfl_sync;
     // see hip_mma.cuh). SMEM_STAGE is ignored and the staging buffer is unconditional.
+    // bits==3 CFG!=0 replaces the sh_stage roundtrip with the decoded-pair fast path
+    // (see G3_FAST below); the 4 KB sh_dec tile buffer replaces it (sh_stage itself
+    // dead-strips from that instantiation).
+#if (defined(__gfx1200__) || defined(__gfx1201__)) && !defined(EXL3_NO_G3FAST)
+    constexpr bool G3_FAST = (bits == 3) && CFG != 0;
+#else
+    constexpr bool G3_FAST = false;
+#endif
+    [[maybe_unused]] __shared__ uint32_t sh_dec[WK][G3_FAST ? 128 : 1];
     __shared__ uint32_t sh_stage[WK][LOADS * LSTRIDE];
 #else
     [[maybe_unused]] __shared__ uint32_t sh_stage[SMEM_STAGE ? WK : 1][SMEM_STAGE ? LOADS * LSTRIDE : 1];
@@ -347,6 +356,25 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                 for (int l = 0; l < LOADS; ++l)
                     pf[d][l] = ld_b(d, l);
 
+        // G3_FAST: prefetch the per-tile window words (x_src_a/x_src_b) PF slices ahead;
+        // bp already carries + lane, so sp - lane is the slice base.
+        uint32_t pf2[PF][WNT][2];
+        if constexpr (G3_FAST)
+        {
+            #pragma unroll
+            for (int d = 0; d < PF; ++d)
+                if (d < myn)
+                {
+                    const uint32_t* sp = bp + (size_t) d * slice_stride - lane;
+                    #pragma unroll
+                    for (int t = 0; t < WNT; ++t)
+                    {
+                        pf2[d][t][0] = *(sp + t * TWORDS + x_src_a);
+                        pf2[d][t][1] = *(sp + t * TWORDS + x_src_b);
+                    }
+                }
+        }
+
 #if defined(USE_ROCM) || defined(__HIPCC__)
         // fp32 accumulator: gfx12 WMMA accumulates in fp32 natively, one 16x16 tile per
         // call, no cadence fold needed
@@ -364,6 +392,8 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             const int i = ib + d;
             if (i >= myn) break;
 
+            [[maybe_unused]] uint32_t dw[WNT][2];
+
             uint32_t bw[LOADS];
             #pragma unroll
             for (int l = 0; l < LOADS; ++l)
@@ -377,17 +407,40 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             }
 
 #if defined(USE_ROCM) || defined(__HIPCC__)
-            // Staged extraction: write valid tile words to warp-private smem, then decode.
-            // The padded K5 tail is never read or written.
-            __syncwarp();
-            #pragma unroll
-            for (int l = 0; l < LOADS; ++l)
+            if constexpr (!G3_FAST)
             {
-                const int stage_word = l * LSTRIDE + lane;
-                if (lane < LSTRIDE && stage_word < WNT * TWORDS)
-                    sh_stage[warp][stage_word] = bw[l];
+                // Staged extraction: write valid tile words to warp-private smem, then
+                // decode. The padded K5 tail is never read or written.
+                __syncwarp();
+                #pragma unroll
+                for (int l = 0; l < LOADS; ++l)
+                {
+                    const int stage_word = l * LSTRIDE + lane;
+                    if (lane < LSTRIDE && stage_word < WNT * TWORDS)
+                        sh_stage[warp][stage_word] = bw[l];
+                }
+                __syncwarp();
             }
-            __syncwarp();
+            else
+            {
+                // G3_FAST: consume prefetched window words, then refill the ring
+                #pragma unroll
+                for (int t = 0; t < WNT; ++t)
+                {
+                    dw[t][0] = pf2[d][t][0];
+                    dw[t][1] = pf2[d][t][1];
+                }
+                if (i + PF < myn)
+                {
+                    const uint32_t* sp = bp + (size_t) (i + PF) * slice_stride - lane;
+                    #pragma unroll
+                    for (int t = 0; t < WNT; ++t)
+                    {
+                        pf2[d][t][0] = *(sp + t * TWORDS + x_src_a);
+                        pf2[d][t][1] = *(sp + t * TWORDS + x_src_b);
+                    }
+                }
+            }
 #else
             if constexpr (SMEM_STAGE)
             {
@@ -419,23 +472,66 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             {
                 FragB f0, f1;
 #if defined(USE_ROCM) || defined(__HIPCC__)
-                const uint32_t* tp = &sh_stage[warp][t * TWORDS];
-                if constexpr (bits == 5 || bits == 6)
-                    dq_dispatch<bits, cb>(tp, lane * 8, f0, f1);
-                else if constexpr (bits == 4)
-                    exl3_gemv_ns::dq8_regs_4bits<cb>(tp[(lane + 31) & 31], tp[lane], f0, f1);
-                else if constexpr (bits == 2)
-                    exl3_gemv_ns::dq8_regs_2bits<cb>(tp[x_src_a], tp[x_src_b], lane << 3, f0, f1);
-                else
-                    exl3_gemv_ns::dq8_regs_3bits<cb>(tp[x_src_a], tp[x_src_b], x_s2, f0, f1);
-
-                // One WMMA covers the full 16x16 tile: f0 = cols 0..7 (b_hi), f1 = cols 8..15
-                // (b_lo); operands are reassembled through the LDS staging inside hip_mma.cuh,
-                // never via lane shuffles
 #if defined(__gfx1200__) || defined(__gfx1201__)
-                mma_ab_h_hip_gfx12_preassembled_a(a_frag, f0, f1, acc[t]);
+                if constexpr (G3_FAST)
+                {
+                    // Decoded-pair fast path: decode this lane's own windows for tile t,
+                    // publish packed pairs via LDS, consume with one aligned b128 read
+                    // (d[j0/2] of producers p0..p0+3 = the four B-operand dwords in AMD
+                    // order), then feed wmma directly. No sh_stage, no assemble_b, no
+                    // fallthrough into the staged tail below.
+                    exl3_gemv_ns::dq8_regs_3bits<cb>(dw[t][0], dw[t][1], x_s2, f0, f1);
+                    uint32_t m0 = *reinterpret_cast<const uint32_t*>(&f0[0]);
+                    uint32_t m1 = *reinterpret_cast<const uint32_t*>(&f0[1]);
+                    uint32_t m2 = *reinterpret_cast<const uint32_t*>(&f1[0]);
+                    uint32_t m3 = *reinterpret_cast<const uint32_t*>(&f1[1]);
+                    uint32_t* dst = &sh_dec[warp][0];
+                    dst[lane] = m0;
+                    dst[32 + lane] = m1;
+                    dst[64 + lane] = m2;
+                    dst[96 + lane] = m3;
+                    __syncwarp();
+                    const int cc = lane & 15;
+                    const int hh = lane >> 4;
+                    const int p0 = (4 * (cc & 7)) & 31;
+                    const int ii = ((2 * t + hh) & 1) + 2 * (cc >= 8);
+                    uint4 b4 = *reinterpret_cast<const uint4*>(&sh_dec[warp][ii * 32 + p0]);
+                    HipFp16x8 b10;
+                    uint32_t* bw10 = reinterpret_cast<uint32_t*>(&b10);
+                    bw10[0] = b4.x; bw10[1] = b4.y; bw10[2] = b4.z; bw10[3] = b4.w;
+                    mma_ab_hip_gfx12_preassembled_ab(a_frag, b10, acc[t]);
+                    __syncwarp();
+                }
+                else
+                {
+                    const uint32_t* tp = &sh_stage[warp][t * TWORDS];
+                    if constexpr (bits == 5 || bits == 6)
+                        dq_dispatch<bits, cb>(tp, lane * 8, f0, f1);
+                    else if constexpr (bits == 4)
+                        exl3_gemv_ns::dq8_regs_4bits<cb>(tp[(lane + 31) & 31], tp[lane], f0, f1);
+                    else if constexpr (bits == 2)
+                        exl3_gemv_ns::dq8_regs_2bits<cb>(tp[x_src_a], tp[x_src_b], lane << 3, f0, f1);
+                    else
+                        exl3_gemv_ns::dq8_regs_3bits<cb>(tp[x_src_a], tp[x_src_b], x_s2, f0, f1);
+
+                    // One WMMA covers the full 16x16 tile: f0 = cols 0..7 (b_hi), f1 =
+                    // cols 8..15 (b_lo); operands are reassembled through the LDS staging
+                    // inside hip_mma.cuh, never via lane shuffles
+                    mma_ab_h_hip_gfx12_preassembled_a(a_frag, f0, f1, acc[t]);
+                }
 #else
-                mma_ab_h_hip(a01, a23, f0, f1, acc[t]);
+                {
+                    const uint32_t* tp = &sh_stage[warp][t * TWORDS];
+                    if constexpr (bits == 5 || bits == 6)
+                        dq_dispatch<bits, cb>(tp, lane * 8, f0, f1);
+                    else if constexpr (bits == 4)
+                        exl3_gemv_ns::dq8_regs_4bits<cb>(tp[(lane + 31) & 31], tp[lane], f0, f1);
+                    else if constexpr (bits == 2)
+                        exl3_gemv_ns::dq8_regs_2bits<cb>(tp[x_src_a], tp[x_src_b], lane << 3, f0, f1);
+                    else
+                        exl3_gemv_ns::dq8_regs_3bits<cb>(tp[x_src_a], tp[x_src_b], x_s2, f0, f1);
+                    mma_ab_h_hip(a01, a23, f0, f1, acc[t]);
+                }
 #endif
 #else
                 if constexpr (SMEM_STAGE)
