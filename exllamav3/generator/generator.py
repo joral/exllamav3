@@ -218,7 +218,7 @@ class Generator:
             self.draft_ids_pinned = torch.empty(
                 (max_batch_size, self.num_draft_tokens),
                 dtype = torch.long,
-                pin_memory = False
+                pin_memory = True
             )
 
         # CPU page cache tier
@@ -628,18 +628,21 @@ class Generator:
         if batch_size == 0:
             return None
 
-        # Create block index table for batch
+        # Create block index table for batch. Device-resident: the draft loop below feeds every
+        # forward from the GPU, so a host-side table would add a blocking H2D per drafted token.
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
-        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
+        device = self.draft_model.output_device
+        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32, device = device)
+        seq_lens = []
         batch = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
             for seq in job.sequences:
                 seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
-                block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
-                cache_seqlens[batch] = seq.kv_position
+                block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index, non_blocking = True)
+                seq_lens.append(seq.kv_position)
                 batch += 1
+        cache_seqlens = torch.tensor(seq_lens, dtype = torch.int32, device = device)
 
         # Indexed embeddings not supported when drafting
         # TODO: Allow multimodal draft model, perhaps with dummy embeddings?
@@ -678,7 +681,7 @@ class Generator:
                 conf, new_ids = torch.max(batch_logits, dim = -1)
             else:
                 new_ids = torch.argmax(batch_logits, dim = -1)
-            self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
+            self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids, non_blocking = True)
             batch_ids.copy_(new_ids)
             cache_seqlens += 1
             if cal is not None:
@@ -707,6 +710,9 @@ class Generator:
                 "window": window,
             }
 
+        # Publish the async readback (see iterate_draftmodel_mtp_gen): one stream sync replaces
+        # the per-drafted-token drains of the blocking copies.
+        torch.cuda.current_stream(device).synchronize()
         return self.draft_ids_pinned[:, :window]
 
 
@@ -724,18 +730,21 @@ class Generator:
         if batch_size == 0:
             return None
 
-        # Create block index table for batch
+        # Create block index table for batch. Device-resident: the draft loop below feeds every
+        # forward from the GPU, so a host-side table would add a blocking H2D per drafted token.
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
-        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
+        device = self.draft_model.output_device
+        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32, device = device)
+        seq_lens = []
         batch = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
             for seq in job.sequences:
                 seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
-                block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
-                cache_seqlens[batch] = seq.kv_position
+                block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index, non_blocking = True)
+                seq_lens.append(seq.kv_position)
                 batch += 1
+        cache_seqlens = torch.tensor(seq_lens, dtype = torch.int32, device = device)
 
         # Collect input IDs
         input_ids_list = []
@@ -778,7 +787,7 @@ class Generator:
             lm_head = self.model.modules[self.model.logit_layer_idx]
             batch_state = lm_head.prepare_for_device(batch_state, params)
             new_ids = self.draft_model.sample_from_state(batch_state, params)
-            self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
+            self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids, non_blocking = True)
             batch_ids.copy_(new_ids)
             cache_seqlens += 1
             temp_hidden = batch_state
@@ -799,6 +808,10 @@ class Generator:
                 "window": window,
             }
 
+        # Publish the async readback: the caller reads draft_ids_pinned contents on the host
+        # immediately after this call (verify-batch assembly, page sequence assignment). One
+        # stream sync here replaces the per-drafted-token drains the blocking copies used to pay.
+        torch.cuda.current_stream(device).synchronize()
         return self.draft_ids_pinned[:, :window]
 
 
