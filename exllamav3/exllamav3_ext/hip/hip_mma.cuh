@@ -147,6 +147,34 @@ __device__ __forceinline__ HipFp16x8 assemble_b_frag_gfx12(const FragB& b_hi, co
 // (documented here so the kernel's reduction stage can consume FragC8 directly.)
 #endif  // __gfx1200__ || __gfx1201__
 
+// Direct A-operand build for gfx12, no LDS staging, no sync: each lane loads its own
+// AMD-ordered fragment straight from the (L2-resident) input activation.
+//   A: lane l, reg r 0..7 -> A[row = l&15][k = (l>>4)*8 + r]   (see layout note above)
+// a_base points at row 0, k = slice_k0; each row is row_stride_h2 half2 apart. Rows past
+// size_m read as zero, matching the staged path's r0_ok/r1_ok masking.
+#if defined(__gfx1200__) || defined(__gfx1201__)
+__device__ __forceinline__ HipFp16x8 assemble_a_direct_gfx12(
+    const half2* a_base,          // &A2[0 + slice8]  (row 0, this k-slice)
+    size_t row_stride_h2,         // size_k / 2
+    int size_m)
+{
+    const int lane = (int)(threadIdx.x & 31);
+    const int row = lane & 15;
+    const int kh = 4 * (lane >> 4);           // half2 offset of this lane's k half
+    HipFp16x8 a = {};
+    if (row < size_m)
+    {
+        const half2* p = a_base + (size_t) row * row_stride_h2 + kh;
+        uint32_t* aw = reinterpret_cast<uint32_t*>(&a);
+        aw[0] = *reinterpret_cast<const uint32_t*>(&p[0]);
+        aw[1] = *reinterpret_cast<const uint32_t*>(&p[1]);
+        aw[2] = *reinterpret_cast<const uint32_t*>(&p[2]);
+        aw[3] = *reinterpret_cast<const uint32_t*>(&p[3]);
+    }
+    return a;
+}
+#endif
+
 // One v_wmma_f32_16x16x16_f16 with BOTH operands preassembled (fp32 accumulate).
 // Used by the bits==3 decoded-pair fast path in exl3_gemv_kernel.cuh, whose B
 // dwords are already in AMD fragment order (decoded pairs staged via LDS).
