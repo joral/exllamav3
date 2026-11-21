@@ -10,7 +10,7 @@
 #include "exl3_dq.cuh"
 #include "hadamard_inner.cuh"
 
-template <int K, int cb>
+template <int K, int cb, bool HALF = false>
 __device__ __forceinline__
 void reconstruct_tile
 (
@@ -20,7 +20,7 @@ void reconstruct_tile
     int packed_n_offset
 )
 {
-    constexpr int packed_size = 256 * K / 16;  // in uint16s
+    constexpr int packed_size = 16 * K + (HALF ? 8 : 0);  // in uint16s
 
     int t = threadIdx.x;
     int lane_id = t % 32;
@@ -39,7 +39,7 @@ void reconstruct_tile
 
     // Dequant
     register FragB frag[2];
-    dq_dispatch<K, cb>(s_packed[warp_id], lane_id * 8, frag[0], frag[1]);
+    dq_dispatch<K, cb, HALF>(s_packed[warp_id], lane_id * 8, frag[0], frag[1]);
 
     // Shuffle from tensor core layout to row major tile
 //    __shared__ half tile[16 * 8 * 16];
@@ -85,7 +85,7 @@ void reconstruct_tile
     *out_int4 = tile_int4[t];
 }
 
-template <int K, int cb>
+template <int K, int cb, bool HALF = false>
 __global__ __launch_bounds__(256)
 void reconstruct_kernel
 (
@@ -95,7 +95,7 @@ void reconstruct_kernel
     int packed_n_offset
 )
 {
-    reconstruct_tile<K, cb>(g_unpacked, g_packed, packed_blocks_n, packed_n_offset);
+    reconstruct_tile<K, cb, HALF>(g_unpacked, g_packed, packed_blocks_n, packed_n_offset);
 }
 
 #if !defined(USE_ROCM)
@@ -136,6 +136,15 @@ constexpr auto reconstruct_kernel_instances = std::array
 };
 #undef __
 
+// Half-integer bitrates K + 0.5 for K = 1..3 (1.5 / 2.5 / 3.5), mul1 codebook only;
+// index KA - 1 into this table
+#define __H(i) reconstruct_kernel<i, 2, true>
+constexpr auto reconstruct_kernel_half_instances = std::array
+{
+    __H(1), __H(2), __H(3)
+};
+#undef __H
+
 /*
 Reconstruct encoded+packed tensor
 */
@@ -143,7 +152,7 @@ void reconstruct_slice
 (
     at::Tensor unpacked,
     at::Tensor packed,
-    int K,
+    double K,
     bool mcg,
     bool mul1,
     int64_t n_offset
@@ -152,13 +161,18 @@ void reconstruct_slice
     const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    // The kernel-instance tables hold 24 entries: K in 1..8 x {plain, mcg, mul1}.
-    // K is derived from the checkpoint (trellis.shape[-1] // 16), so an untrusted
-    // model file can drive cbi outside the table and launch whatever pointer lies
-    // there. Bound both the input and the computed index.
+    // K may be half-integer (K = KA + 0.5, mul1 codebook): tiles carry 16 * KA + 8 uint16.
+    // The kernel-instance tables hold 24 integer entries: K in 1..8 x {plain, mcg, mul1},
+    // plus 3 half-integer entries (KA = 1..3, mul1). K comes from the checkpoint
+    // (trellis.shape[-1] / 16), so an untrusted model file could drive the instance index
+    // outside a table and launch whatever pointer lies there. Bound everything.
     TORCH_CHECK(K >= 1 && K <= 8, "K must be in 1..8, got ", K);
+    int KA = (int) K;
+    bool half_k = (K - KA) > 0.25;
+    TORCH_CHECK(!half_k || mul1, "half-integer bitrates require the mul1 codebook");
+    TORCH_CHECK(!half_k || (KA >= 1 && KA <= 3), "half-integer bitrates support K = 1.5 / 2.5 / 3.5, got ", K);
     TORCH_CHECK_SHAPES(unpacked, 0, packed, 0, 16);
-    TORCH_CHECK_SIZE(packed, 2, 256 * K / 16);
+    TORCH_CHECK_SIZE(packed, 2, 16 * KA + (half_k ? 8 : 0));
     TORCH_CHECK_DTYPE(unpacked, kHalf);
 
     int rows = packed.size(0);
@@ -178,7 +192,22 @@ void reconstruct_slice
     dim3 blockDim(256);
     dim3 gridDim(cols / 8, rows);
 
-    int cbi = K - 1;
+    const uint16_t* packed_ptr = (const uint16_t*) packed.data_ptr();
+    if (half_k)
+    {
+        auto reconstruct_kernel = reconstruct_kernel_half_instances[KA - 1];
+        reconstruct_kernel<<<gridDim, blockDim, 0, stream>>>
+        (
+            (half*) unpacked.data_ptr(),
+            packed_ptr,
+            packed_cols,
+            packed_n_offset
+        );
+        cuda_check(cudaPeekAtLastError());
+        return;
+    }
+
+    int cbi = KA - 1;
     if (mcg) cbi += 8;
     else if (mul1) cbi += 16;
     TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_kernel_instances.size(),
@@ -188,7 +217,7 @@ void reconstruct_slice
     reconstruct_kernel<<<gridDim, blockDim, 0, stream>>>
     (
         (half*) unpacked.data_ptr(),
-        (const uint16_t*) packed.data_ptr(),
+        packed_ptr,
         packed_cols,
         packed_n_offset
     );
@@ -206,7 +235,7 @@ void reconstruct_slice
 // column-then-row order is H W H).
 #define RH_THREADS 256
 
-template <int K, int cb>
+template <int K, int cb, bool HALF = false>
 __device__ __forceinline__
 void reconstruct_had_tile
 (
@@ -218,7 +247,7 @@ void reconstruct_had_tile
     int packed_n_offset
 )
 {
-    constexpr int packed_size = 256 * K / 16;
+    constexpr int packed_size = 16 * K + (HALF ? 8 : 0);
     constexpr float r_scale = 0.08838834764831845f;
 
     int t = threadIdx.x;
@@ -253,7 +282,7 @@ void reconstruct_had_tile
         int j = (warp_id / 8) * (8 / (RH_THREADS / 256)) + jj;
         int wn = warp_id % 8;
         register FragB frag[2];
-        dq_dispatch<K, cb>(s_packed[j][wn], lane_id * 8, frag[0], frag[1]);
+        dq_dispatch<K, cb, HALF>(s_packed[j][wn], lane_id * 8, frag[0], frag[1]);
 
         half2 n0 = __shfl_down_sync(0xFFFFFFFF, frag[0][0], 4, 32);
         half2 n1 = __shfl_down_sync(0xFFFFFFFF, frag[0][1], 4, 32);
@@ -360,7 +389,7 @@ void reconstruct_had_tile
 }
 
 
-template <int K, int cb>
+template <int K, int cb, bool HALF = false>
 __global__ __launch_bounds__(RH_THREADS)
 void reconstruct_had_kernel
 (
@@ -372,7 +401,7 @@ void reconstruct_had_kernel
     int packed_n_offset
 )
 {
-    reconstruct_had_tile<K, cb>(g_unpacked, g_packed, suh, svh, packed_blocks_n, packed_n_offset);
+    reconstruct_had_tile<K, cb, HALF>(g_unpacked, g_packed, suh, svh, packed_blocks_n, packed_n_offset);
 }
 
 #if !defined(USE_ROCM)
@@ -421,6 +450,15 @@ constexpr auto reconstruct_had_kernel_instances = std::array
 };
 #undef __
 
+// Half-integer bitrates K + 0.5 for K = 1..3 (1.5 / 2.5 / 3.5), mul1 codebook only;
+// index KA - 1 into this table
+#define __H(i) reconstruct_had_kernel<i, 2, true>
+constexpr auto reconstruct_had_kernel_half_instances = std::array
+{
+    __H(1), __H(2), __H(3)
+};
+#undef __H
+
 /*
 Reconstruct in the original (unrotated) basis: fused suh/H/W_hat/H/svh. Both dims must be
 multiples of 128. n_offset slices along n; svh must be pre-offset by the caller.
@@ -431,7 +469,7 @@ void reconstruct_had_slice
     at::Tensor packed,
     at::Tensor suh,
     at::Tensor svh,
-    int K,
+    double K,
     bool mcg,
     bool mul1,
     int64_t n_offset
@@ -440,13 +478,17 @@ void reconstruct_had_slice
     const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    // The kernel-instance tables hold 24 entries: K in 1..8 x {plain, mcg, mul1}.
-    // K is derived from the checkpoint (trellis.shape[-1] // 16), so an untrusted
-    // model file can drive cbi outside the table and launch whatever pointer lies
-    // there. Bound both the input and the computed index.
+    // K may be half-integer (K = KA + 0.5, mul1 codebook): tiles carry 16 * KA + 8 uint16.
+    // The kernel-instance tables hold 24 integer entries: K in 1..8 x {plain, mcg, mul1},
+    // plus 3 half-integer entries (KA = 1..3, mul1). Bound the input and the computed
+    // index so an untrusted model file can't launch an out-of-table pointer.
     TORCH_CHECK(K >= 1 && K <= 8, "K must be in 1..8, got ", K);
+    int KA = (int) K;
+    bool half_k = (K - KA) > 0.25;
+    TORCH_CHECK(!half_k || mul1, "half-integer bitrates require the mul1 codebook");
+    TORCH_CHECK(!half_k || (KA >= 1 && KA <= 3), "half-integer bitrates support K = 1.5 / 2.5 / 3.5, got ", K);
     TORCH_CHECK_SHAPES(unpacked, 0, packed, 0, 16);
-    TORCH_CHECK_SIZE(packed, 2, 256 * K / 16);
+    TORCH_CHECK_SIZE(packed, 2, 16 * KA + (half_k ? 8 : 0));
     TORCH_CHECK_DTYPE(unpacked, kHalf);
     TORCH_CHECK_DTYPE(suh, kHalf);
     TORCH_CHECK_DTYPE(svh, kHalf);
@@ -465,7 +507,24 @@ void reconstruct_had_slice
     dim3 blockDim(256);
     dim3 gridDim(unpacked.size(1) / 128, unpacked.size(0) / 128);
 
-    int cbi = K - 1;
+    const uint16_t* packed_ptr = (const uint16_t*) packed.data_ptr();
+    if (half_k)
+    {
+        auto reconstruct_had_kernel = reconstruct_had_kernel_half_instances[KA - 1];
+        reconstruct_had_kernel<<<gridDim, RH_THREADS, 0, stream>>>
+        (
+            (half*) unpacked.data_ptr(),
+            packed_ptr,
+            (const half*) suh.data_ptr(),
+            (const half*) svh.data_ptr(),
+            packed.size(1),
+            (int) (n_offset / 16)
+        );
+        cuda_check(cudaPeekAtLastError());
+        return;
+    }
+
+    int cbi = KA - 1;
     if (mcg) cbi += 8;
     else if (mul1) cbi += 16;
     TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_had_kernel_instances.size(),
@@ -475,7 +534,7 @@ void reconstruct_had_slice
     reconstruct_had_kernel<<<gridDim, RH_THREADS, 0, stream>>>
     (
         (half*) unpacked.data_ptr(),
-        (const uint16_t*) packed.data_ptr(),
+        packed_ptr,
         (const half*) suh.data_ptr(),
         (const half*) svh.data_ptr(),
         packed.size(1),
@@ -488,7 +547,7 @@ void reconstruct
 (
     at::Tensor unpacked,
     at::Tensor packed,
-    int K,
+    double K,
     bool mcg,
     bool mul1
 )

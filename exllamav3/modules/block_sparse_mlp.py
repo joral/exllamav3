@@ -417,6 +417,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 case "swiglu_oai":
                     self.activation_fn_call = ext.silu_oai_mul
                     self.activation_fn_idx = 3
+                case "swiglu_i2":
+                    self.activation_fn_call = ext.silu_i2_mul
+                    self.activation_fn_idx = 5
                 case "relu2":
                     self.activation_fn_call = ext.relu2_mul
                     self.activation_fn_idx = 2
@@ -577,11 +580,19 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # projections; configurations with any of those run every batch size through the dense
         # per-expert path, which handles all of them (gpt-oss)
         has_mgemm = hasattr(ext, "exl3_mgemm")
+        # Mixed-K expert groups (per-expert bitrates, external quantizers) can't share the
+        # grouped trellis tables the mgemm/BC fast paths need; those fall back to the
+        # per-expert tier
+        def _uniform_k(ls):
+            k = ls[0].inner.K
+            return all(l.inner.K == k for l in ls)
+
         self.support_quant_paths = (
             has_mgemm and self.is_quantized and
             (self.activation_fn in ("silu", "gelu") if self.gated else self.activation_fn == "relu2") and
             all(l.inner.bias is None for l in self.gates + self.ups + self.downs) and
-            all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs)
+            all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs) and
+            _uniform_k(self.gates) and _uniform_k(self.ups) and _uniform_k(self.downs)
         )
 
         # The fused bsz<=MAX_BSZN kernels (BC_BlockSparseMLP.run_bszN) additionally support
@@ -595,6 +606,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             has_mgemm and self.is_quantized and
             (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2") and
             _uniform_bias(self.gates) and _uniform_bias(self.ups) and _uniform_bias(self.downs) and
+            _uniform_k(self.gates) and _uniform_k(self.ups) and _uniform_k(self.downs) and
             not self.config.infer_params.no_reconstruct
         )
 

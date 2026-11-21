@@ -92,7 +92,11 @@ class LinearEXL3:
         self.suh = suh if suh is not None else self.unpack_bf(su)
         self.svh = svh if svh is not None else self.unpack_bf(sv)
         self.trellis = trellis
-        self.K = trellis.shape[-1] // 16
+        # Bitrate from the tile width: 16 * K uint16 per tile, 16 * K + 8 for half-integer
+        # K (K + 0.5, mul1 codebook only)
+        K_float = trellis.shape[-1] / 16
+        self.K = int(K_float) if K_float.is_integer() else K_float
+        self.half_k = not K_float.is_integer()
         self.in_features = in_features
         self.out_features = out_features
         self.bias = bias
@@ -104,6 +108,8 @@ class LinearEXL3:
         self.mul1_tensor = mul1
         self.mcg = self.mcg_tensor is not None
         self.mul1 = self.mul1_tensor is not None
+        assert not self.half_k or self.mul1, \
+            f"{key}: half-integer bitrate {self.K} requires the mul1 codebook"
 
         self._fused_reconstruct = None
         self.bsz1_xh_args = (self.trellis.device, (1, self.in_features), self.out_dtype)
@@ -111,7 +117,8 @@ class LinearEXL3:
             self.trellis,
             self.suh,
             self.svh,
-            self.K,
+            # BC kernels only pack integer-K tiles; half-K forwards never reach them
+            int(self.K),
             self.bias,
             self.mcg,
             self.mul1,
@@ -159,6 +166,11 @@ class LinearEXL3:
         assert x.is_contiguous(), f"LinearEXL3 {self.key}: non-contiguous input {tuple(x.shape)}"
 
         reconstruct = params.get("reconstruct")
+        if not reconstruct and self.half_k:
+            # Half-integer bitrates: the GEMV / BC kernels pack tiles as 16 * K uint16 and
+            # would silently misread the 16 * K + 8 layout, so these tensors always ride
+            # the reconstruct + hgemm path
+            return self.reconstruct_hgemm(x, out_dtype)
         if not reconstruct:
             rows = x.numel() // x.shape[-1]
             if rows <= AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct:

@@ -69,6 +69,34 @@ def silu_oai_mul(
         r = r.clamp(min = -65504.0, max = 65504.0)
     z.copy_(r)
 
+
+# Inkling-2 softcapped SwiGLU: tanh softcaps on gate and up, sigmoid on the raw gate, no
+# clamping and no up-path bias. act_limit carries the gate softcap; the up softcap is a family
+# constant of the architecture (asserted at load in architecture/inkling2.py).
+I2_UP_SOFTCAP = 25.0
+
+
+def silu_i2_mul(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    z: torch.Tensor,
+    act_limit: float = 0.0,
+) -> None:
+    if x.dtype not in (torch.float16, torch.float32) or y.dtype != x.dtype or z.dtype != torch.float16:
+        raise TypeError("silu_i2_mul expects matching float16/float32 inputs and float16 output")
+    gate = x.float()
+    up = y.float()
+    gate_cap = float(act_limit) if act_limit else 0.0
+    if gate_cap > 0.0:
+        gate = gate_cap * torch.tanh(gate / gate_cap)
+    up = I2_UP_SOFTCAP * torch.tanh(up / I2_UP_SOFTCAP)
+    r = gate * torch.sigmoid(x.float()) * up
+    if x.dtype == torch.float32 and z.dtype == torch.float16:
+        r = r.clamp(min = -65504.0, max = 65504.0)
+    # The reference computes the act in fp32 and stores bf16 (adt) before the down projection;
+    # rounding here (bf16 values are exact in fp16/fp32) keeps every engine tier bit-compatible
+    z.copy_(r.to(torch.bfloat16))
+
 def gelu_mul(
     x: torch.Tensor,
     y: torch.Tensor,

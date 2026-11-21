@@ -56,11 +56,12 @@ _ACT_CALLS_GATED = {
     "silu": ext.silu_mul,
     "gelu": ext.gelu_mul,
     "swiglu_oai": ext.silu_oai_mul,
+    "swiglu_i2": ext.silu_i2_mul,
     "relu2": ext.relu2_mul,
 }
 _ACT_CALLS_GATELESS = {"relu2": ext.relu_mul}
 # MoeCpuHost spec["activation"] indices
-_ACT_IDX = {0: "silu", 1: "gelu", 2: "relu2", 3: "swiglu_oai"}
+_ACT_IDX = {0: "silu", 1: "gelu", 2: "relu2", 3: "swiglu_oai", 5: "swiglu_i2"}
 
 
 def plan_groups(experts, count_of, batch_max = None):

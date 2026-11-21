@@ -189,7 +189,7 @@ if torch.version.hip:
     from . import ext_fallbacks as _fb
 
     for _name in [
-        'silu_mul', 'silu_oai_mul', 'gelu_mul', 'relu2_mul', 'relu_mul', 'xielu',
+        'silu_mul', 'silu_oai_mul', 'silu_i2_mul', 'gelu_mul', 'relu2_mul', 'relu_mul', 'xielu',
         'apply_logit_bitmask',
         'mul_sigmoid_', 'mul_sigmoid_broadcast_', 'mul_softplus_broadcast_',
         'add_sigmoid_gate', 'add_sigmoid_gate_proj', 'deinterleave_qg',
