@@ -76,8 +76,9 @@ def pick(M, N, K, w8):
     if key in CONFIGS:
         return CONFIGS[key]
     if M > 64:
-        return (64, 64, 1, 8, 3)
-    return (64, 128, 1, 4, 4)
+        # shared = (BM + BN) * BK * 2 bytes * num_stages; gfx1200 (RDNA4) caps at 64 KiB
+        return (64, 64, 1, 8, 2)
+    return (64, 64, 1, 4, 3)
 
 
 def skinny_mm(x, w, scale=None, out=None, out_dtype=torch.bfloat16, cfg=None):

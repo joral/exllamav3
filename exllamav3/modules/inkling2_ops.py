@@ -290,13 +290,13 @@ def _qkv_post_kernel(
         tl.store(ks_ptr + row * sc_stride_pos + hk * NG + offs_ng, ksg.to(tl.float16))
         tl.store(vs_ptr + row * sc_stride_pos + hk * NG + offs_ng, vsg.to(tl.float16))
         if Q16 and BITS == 4:
-            kqf = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.rint(kg / ksg[:, None] + 7.5), 0.0), 15.0)
-            vqf = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.rint(vg / vsg[:, None] + 7.5), 0.0), 15.0)
+            kqf = tl.minimum(tl.maximum(tl.extra.libdevice.rint(kg / ksg[:, None] + 7.5), 0.0), 15.0)
+            vqf = tl.minimum(tl.maximum(tl.extra.libdevice.rint(vg / vsg[:, None] + 7.5), 0.0), 15.0)
             kqf = tl.reshape(kqf, [DH]) - 8.0                   # stored as (code - 8) + 8 like the plain path
             vqf = tl.reshape(vqf, [DH]) - 8.0
         else:
-            kqf = tl.reshape(tl.minimum(tl.maximum(tl.extra.cuda.libdevice.rint(kg / ksg[:, None]), -QMAX2 - 1), QMAX2), [DH])
-            vqf = tl.reshape(tl.minimum(tl.maximum(tl.extra.cuda.libdevice.rint(vg / vsg[:, None]), -QMAX2 - 1), QMAX2), [DH])
+            kqf = tl.reshape(tl.minimum(tl.maximum(tl.extra.libdevice.rint(kg / ksg[:, None]), -QMAX2 - 1), QMAX2), [DH])
+            vqf = tl.reshape(tl.minimum(tl.maximum(tl.extra.libdevice.rint(vg / vsg[:, None]), -QMAX2 - 1), QMAX2), [DH])
         if BITS == 8:
             tl.store(kbase + offs_d, kqf.to(tl.int8))
             tl.store(vbase + offs_d, vqf.to(tl.int8))
@@ -312,8 +312,8 @@ def _qkv_post_kernel(
         QMAX: tl.constexpr = 127 if BITS == 8 else 7
         ksc = tl.maximum(tl.max(tl.abs(kk), 0) / QMAX, 1e-8)
         vsc = tl.maximum(tl.max(tl.abs(vv), 0) / QMAX, 1e-8)
-        kqf = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.rint(kk / ksc), -QMAX - 1), QMAX)
-        vqf = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.rint(vv / vsc), -QMAX - 1), QMAX)
+        kqf = tl.minimum(tl.maximum(tl.extra.libdevice.rint(kk / ksc), -QMAX - 1), QMAX)
+        vqf = tl.minimum(tl.maximum(tl.extra.libdevice.rint(vv / vsc), -QMAX - 1), QMAX)
         tl.store(ks_ptr + row * sc_stride_pos + hk, ksc.to(tl.float16))
         tl.store(vs_ptr + row * sc_stride_pos + hk, vsc.to(tl.float16))
         if BITS == 8:
