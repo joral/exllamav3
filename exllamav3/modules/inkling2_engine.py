@@ -123,6 +123,11 @@ class I2Engine:
             for p in range(1, c.loop_passes):
                 for i in range(c.loop_start, c.loop_end):
                     self.rings[c.cache_vidx(i, p)] = (z(self.Hkl * 128), z(self.Hkl * 128), z(D), z(D))
+        # Caller-managed page table: the engine never assigns pages. Each slot's logical pages must be mapped to
+        # DISJOINT physical page ids by the caller BEFORE that slot's first forward — the zeros default maps every
+        # slot's logical page 0 to physical page 0, so unassigned slots share one page (silent cross-slot KV
+        # contamination). The physical pool (num_pages) is likewise the caller's to partition, e.g. static
+        # num_pages // max_slots pages per slot: page_table[s, :n] = arange(s * n, (s + 1) * n).
         self.page_table = torch.zeros((max_slots, max_pages_per_seq), dtype = torch.int32, device = dev)
         self.group = None
         self.moe_chunk_max = int(__import__('os').environ.get('I2_MOE_CHUNK_MAX', 192))
